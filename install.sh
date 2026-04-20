@@ -1,404 +1,258 @@
-#!/bin/bash
-
-# ====================================================================
-# Xray VLESS-REALITY + WARP (Socks5) Auto-Deployment Script
-# Target OS: Rocky Linux 8
-# Features: Idempotent, Automated Routing, Watchdog, Health Check
-# ====================================================================
-
-set -e
-set -o pipefail
-
-# ========== User Configuration (Variables) ==========
-XRAY_PORT=443
-FALLBACK_PORT=8080
-WARP_PORT=40000
-
-TARGET_SNI="www.nvidia.com"
-XRAY_CONFIG="/usr/local/etc/xray/config.json"
-XRAY_BIN="/usr/local/bin/xray"
-XRAY_SERVICE="xray"
-
-WARP_WATCHDOG_SCRIPT="/usr/local/bin/warp-watchdog.sh"
-CRON_FILE="/etc/cron.d/xray-maintenance"
-
-# Color outputs
-GREEN='\033[1;32m'
-YELLOW='\033[1;33m'
-RED='\033[1;31m'
-NC='\033[0m'
-
-log() { echo -e "${GREEN}[INFO]${NC} $1"; }
-warn() { echo -e "${YELLOW}[WARN]${NC} $1"; }
-err() { echo -e "${RED}[ERROR]${NC} $1"; exit 1; }
-
-echo "========================================================="
-echo "   Xray VLESS-REALITY + WARP Installation Script         "
-echo "                Target: Rocky Linux 8                    "
-echo "========================================================="
-
-# ========== 0. Pre-flight Checks ==========
-log "Checking OS compatibility..."
-if ! grep -qi "Rocky Linux" /etc/redhat-release || ! grep -q "release 8" /etc/redhat-release; then
-    err "This script is strictly designed for Rocky Linux 8. Aborting."
-fi
-
-if [ "$EUID" -ne 0 ]; then
-    err "Please run this script as root."
-fi
-
-# ========== 1. System Update & Dependencies ==========
-log "Installing dependencies..."
-dnf install -y epel-release >/dev/null 2>&1
-dnf install -y curl wget socat jq tzdata util-linux nginx >/dev/null 2>&1
-
-# ========== 2. Setup Timezone & SELinux ==========
-log "Configuring Timezone (Asia/Shanghai)..."
-timedatectl set-timezone Asia/Shanghai
-
-log "Disabling SELinux..."
-if [ "$(getenforce)" != "Disabled" ]; then
-    setenforce 0 || true
-    sed -i 's/^SELINUX=.*/SELINUX=disabled/' /etc/selinux/config
-fi
-
-# ========== 3. Network Optimization (BBR) ==========
-log "Applying TCP/BBR Optimizations..."
-cat <<EOF > /etc/sysctl.d/99-xray-optimizations.conf
-net.core.default_qdisc=fq
-net.ipv4.tcp_congestion_control=bbr
-net.ipv4.tcp_fastopen=3
-net.ipv4.tcp_tw_reuse=1
-net.core.rmem_max=33554432
-net.core.wmem_max=33554432
-net.ipv4.tcp_rmem=4096 87380 33554432
-net.ipv4.tcp_wmem=4096 65536 33554432
-net.ipv4.tcp_mtu_probing=1
-net.ipv4.tcp_slow_start_after_idle=0
-EOF
-sysctl --system >/dev/null 2>&1
-
-# ========== 4. Nginx Decoy Setup ==========
-log "Configuring Nginx Decoy on port ${FALLBACK_PORT}..."
-cat <<EOF > /etc/nginx/nginx.conf
-user nginx;
-worker_processes auto;
-error_log /var/log/nginx/error.log;
-pid /run/nginx.pid;
-
-events { worker_connections 1024; }
-
-http {
-    include             /etc/nginx/mime.types;
-    default_type        application/octet-stream;
-    sendfile            on;
-    keepalive_timeout   65;
-    server {
-        listen       ${FALLBACK_PORT};
-        listen       [::]:${FALLBACK_PORT};
-        server_name  _;
-        root         /usr/share/nginx/html;
-        location / { index index.html; }
-    }
-}
-EOF
-systemctl enable --now nginx >/dev/null 2>&1
-systemctl restart nginx
-
-# ========== 5. Install & Configure WARP (Socks5) ==========
-log "Setting up Cloudflare WARP..."
-if [ ! -f /etc/yum.repos.d/cloudflare-warp.repo ]; then
-  curl -fsSL https://pkg.cloudflareclient.com/cloudflare-warp-ascii.repo | tee /etc/yum.repos.d/cloudflare-warp.repo >/dev/null
-fi
-dnf -y install cloudflare-warp >/dev/null 2>&1
-
-systemctl enable --now warp-svc >/dev/null 2>&1
-sleep 2
-
-# Robust Registration: Handle TOS and existing broken registrations
-if ! warp-cli --accept-tos account 2>/dev/null | grep -q "Account Type"; then
-  log "Registering WARP (Auto-accepting TOS)..."
-  warp-cli --accept-tos registration delete >/dev/null 2>&1 || true
-  warp-cli --accept-tos registration new >/dev/null 2>&1 || true
-fi
-
-log "Configuring WARP Proxy & Watchdog Services..."
-cat > /etc/systemd/system/warp-proxy.service <<EOF
-[Unit]
-Description=WARP Proxy Init (SOCKS5 ${WARP_PORT})
-After=network-online.target warp-svc.service
-Wants=network-online.target
-
-[Service]
-Type=oneshot
-ExecStart=/bin/bash -c "warp-cli --accept-tos mode proxy >/dev/null 2>&1 || true; warp-cli --accept-tos proxy port ${WARP_PORT} >/dev/null 2>&1 || true; warp-cli --accept-tos connect >/dev/null 2>&1 || true"
-RemainAfterExit=yes
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-cat > "$WARP_WATCHDOG_SCRIPT" <<EOF
-#!/bin/bash
-set -euo pipefail
-WARP_PORT=${WARP_PORT}
-systemctl is-active --quiet warp-svc || systemctl restart warp-svc
-if warp-cli --accept-tos status 2>/dev/null | grep -q "Connected"; then
-  ss -lnt 2>/dev/null | grep -q ":\$WARP_PORT " && exit 0
-fi
-warp-cli --accept-tos mode proxy >/dev/null 2>&1 || true
-warp-cli --accept-tos proxy port \$WARP_PORT >/dev/null 2>&1 || true
-warp-cli --accept-tos connect >/dev/null 2>&1 || true
-EOF
-chmod +x "$WARP_WATCHDOG_SCRIPT"
-
-cat > /etc/systemd/system/warp-watchdog.service <<EOF
-[Unit]
-Description=WARP Watchdog
-
-[Service]
-Type=oneshot
-ExecStart=${WARP_WATCHDOG_SCRIPT}
-EOF
-
-cat > /etc/systemd/system/warp-watchdog.timer <<EOF
-[Unit]
-Description=Run WARP Watchdog every 2 minutes
-
-[Timer]
-OnBootSec=30
-OnUnitActiveSec=120
-Unit=warp-watchdog.service
-
-[Install]
-WantedBy=timers.target
-EOF
-
-systemctl daemon-reload
-systemctl enable --now warp-proxy.service >/dev/null 2>&1
-systemctl enable --now warp-watchdog.timer >/dev/null 2>&1
-
-# ========== 6. Install Xray Core ==========
-log "Installing Xray Core..."
-bash -c "$(curl -L https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install -u root >/dev/null 2>&1
-
-# ========== 7. Handle Credentials (Idempotency) ==========
-log "Checking for existing Xray credentials..."
-UUID=""
-PRIVATE_KEY=""
-SHORT_ID=""
-
-if [ -f "$XRAY_CONFIG" ] && command -v jq >/dev/null; then
-    UUID=$(jq -r '.inbounds[0].settings.clients[0].id' "$XRAY_CONFIG" 2>/dev/null || true)
-    PRIVATE_KEY=$(jq -r '.inbounds[0].streamSettings.realitySettings.privateKey' "$XRAY_CONFIG" 2>/dev/null || true)
-    SHORT_ID=$(jq -r '.inbounds[0].streamSettings.realitySettings.shortIds[0]' "$XRAY_CONFIG" 2>/dev/null || true)
-fi
-
-# Clean up empty strings from broken jq reads (Fixing the previous syntax bug)
-if [ "$UUID" == "null" ]; then 
-    UUID=""
-fi
-
-if [ "$PRIVATE_KEY" == "null" ]; then 
-    PRIVATE_KEY=""
-fi
-
-if [ "$SHORT_ID" == "null" ]; then 
-    SHORT_ID=""
-fi
-
-# Generate credentials if they are empty
-if [ -z "$UUID" ]; then
-    UUID=$(uuidgen)
-    log "Generated new UUID."
-fi
-
-if [ -z "$PRIVATE_KEY" ]; then
-    KEY_PAIR=$($XRAY_BIN x25519)
-    PRIVATE_KEY=$(echo "$KEY_PAIR" | grep -i "Private" | cut -d':' -f2 | tr -d ' ' | tr -d '\r')
-    PUBLIC_KEY=$(echo "$KEY_PAIR" | grep -i "Public" | cut -d':' -f2 | tr -d ' ' | tr -d '\r')
-    log "Generated new REALITY Key Pair."
-else
-    PUBLIC_KEY=$($XRAY_BIN x25519 -i "$PRIVATE_KEY" | grep -i "Public" | cut -d':' -f2 | tr -d ' ' | tr -d '\r')
-    log "Restored existing REALITY Keys."
-fi
-
-if [ -z "$SHORT_ID" ]; then
-    SHORT_ID=$(openssl rand -hex 4)
-    log "Generated new ShortID."
-fi
-
-# ========== 8. Write Xray Configuration ==========
-log "Generating Xray Configuration..."
-mkdir -p "$(dirname "$XRAY_CONFIG")"
-mkdir -p /var/log/xray
-chown -R root:root /var/log/xray
-
-cat <<EOF > "$XRAY_CONFIG"
-{
-  "log": { "loglevel": "error", "access": "/dev/null", "error": "/var/log/xray/error.log" },
-  "dns": {
-    "tag": "dns-internal",
-    "queryStrategy": "UseIP",
-    "disableCache": false,
-    "servers":[
-      { "address": "https://1.1.1.1/dns-query", "domains": ["geosite:geolocation-!cn"], "skipFallback": true },
-      { "address": "https://223.5.5.5/dns-query", "domains":["geosite:cn"], "expectIPs": ["geoip:cn"], "skipFallback": false }
-    ]
-  },
-  "routing": {
-    "domainStrategy": "IPOnDemand",
-    "rules":[
-      { "type": "field", "outboundTag": "block", "protocol": ["bittorrent"] },
-      { "type": "field", "outboundTag": "block", "domain":["geosite:category-ads-all"] },
-      { "type": "field", "outboundTag": "block", "ip": ["geoip:private"] },
-      { "type": "field", "outboundTag": "block", "domain": ["geosite:cn"] },
-      { "type": "field", "outboundTag": "block", "ip": ["geoip:cn"] },
-      { "type": "field", "outboundTag": "direct", "domain":[
-        "domain:whatismyipaddress.com", "domain:google.com", "domain:googleapis.com", 
-        "domain:gstatic.com", "domain:gmail.com", "domain:chatgpt.com", "domain:openai.com", 
-        "domain:oaistatic.com", "domain:oaiusercontent.com", "domain:anthropic.com", 
-        "domain:claude.ai", "domain:linux.do", "domain:idcflare.com", "domain:dmit.io", "domain:vmrack.net"
-      ]},
-      { "type": "field", "outboundTag": "warp", "domain":["geosite:geolocation-!cn"]},
-      { "type": "field", "outboundTag": "warp", "ip":["geoip:!cn"]},
-      { "type": "field", "network": "tcp,udp", "outboundTag": "warp" }
-    ]
-  },
-  "inbounds":[
-    {
-      "listen": "::",
-      "port": ${XRAY_PORT},
-      "protocol": "vless",
-      "settings": {
-        "clients":[{ "id": "${UUID}", "flow": "xtls-rprx-vision" }],
-        "decryption": "none",
-        "fallbacks":[{ "dest": ${FALLBACK_PORT}, "xver": 0 }]
-      },
-      "streamSettings": {
-        "network": "tcp",
-        "security": "reality",
-        "realitySettings": {
-          "show": false,
-          "dest": "${TARGET_SNI}:443",
-          "xver": 0,
-          "serverNames":["${TARGET_SNI}"],
-          "privateKey": "${PRIVATE_KEY}",
-          "shortIds":["${SHORT_ID}"]
-        },
-        "sockopt": { "tcpFastOpen": false, "freebind": true }
-      },
-      "sniffing": { "enabled": true, "destOverride":["http", "tls", "quic"], "metadataOnly": false, "routeOnly": true }
-    }
-  ],
-  "outbounds":[
-    { "tag": "warp","protocol":"socks","settings":{"servers":[{"address":"127.0.0.1","port":${WARP_PORT}}]}},
-    { "tag": "direct", "protocol": "freedom", "settings": { "domainStrategy": "UseIPv4" } },
-    { "tag": "block", "protocol": "blackhole" }
-  ]
-}
-EOF
-
-# ========== 9. Finalize Xray Services ==========
-log "Validating Xray config..."
-if ! $XRAY_BIN -test -config "$XRAY_CONFIG"; then
-    echo -e "\n${RED}[ERROR] Xray configuration validation failed!${NC}"
-    exit 1
-fi
-log "Configuration OK."
-
-systemctl enable --now $XRAY_SERVICE >/dev/null 2>&1
-systemctl restart $XRAY_SERVICE
-
-# ========== 10. Firewall Configuration ==========
-log "Configuring Firewalld..."
-if systemctl is-active --quiet firewalld; then
-    firewall-cmd --permanent --add-port=${XRAY_PORT}/tcp >/dev/null 2>&1 || true
-    firewall-cmd --reload >/dev/null 2>&1
-else
-    warn "Firewalld is not running. Skipping port rules."
-fi
-
-# ========== 11. Maintenance Cron Jobs (Idempotent) ==========
-log "Adding Maintenance Cron Jobs to /etc/cron.d/ ..."
-cat <<EOF > "$CRON_FILE"
-# Xray & System Maintenance Tasks
-0 * * * * root sync; echo 3 > /proc/sys/vm/drop_caches
-0 2 * * 0 root bash -c "\$(curl -sL https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install -u root >/dev/null 2>&1
-0 3 * * 0 root dnf -y upgrade >> /var/log/dnf-upgrade.log 2>&1 && /sbin/reboot
-EOF
-chmod 644 "$CRON_FILE"
-
-# ========== 12. Final Health Check ==========
-echo -e "\n${YELLOW}>>> Performing final health checks on all components...${NC}"
-HEALTH_FLAG=0
-
-if systemctl is-active --quiet nginx; then
-    echo -e "  [✔] Nginx (Decoy)   : ${GREEN}Running${NC}"
-else
-    echo -e "  [✘] Nginx (Decoy)   : ${RED}Failed${NC} (Check: journalctl -u nginx --no-pager -n 20)"
-    HEALTH_FLAG=1
-fi
-
-if systemctl is-active --quiet warp-svc && ss -lnt | grep -q ":${WARP_PORT} "; then
-    echo -e "  [✔] WARP (Socks5)   : ${GREEN}Running & Proxying on port ${WARP_PORT}${NC}"
-else
-    echo -e "  [✘] WARP (Socks5)   : ${RED}Failed${NC} (Check: warp-cli status OR systemctl status warp-proxy)"
-    HEALTH_FLAG=1
-fi
-
-if systemctl is-active --quiet $XRAY_SERVICE; then
-    echo -e "  [✔] Xray Core       : ${GREEN}Running${NC}"
-else
-    echo -e "  [✘] Xray Core       : ${RED}Failed${NC} (Check: journalctl -u $XRAY_SERVICE --no-pager -n 20)"
-    HEALTH_FLAG=1
-fi
-
-if [ "$HEALTH_FLAG" -ne 0 ]; then
-    echo -e "\n${RED}=========================================================${NC}"
-    echo -e "${RED}   Deployment Finished with Errors!                      ${NC}"
-    echo -e "${RED}   Please fix the failed services before using.          ${NC}"
-    echo -e "${RED}=========================================================${NC}\n"
-    exit 1
-fi
-
-# ========== 13. Output Information ==========
-IPV4=$(curl -s4 https://api.ipify.org || echo "YOUR_IPV4")
-
-echo -e "\n${GREEN}=========================================================${NC}"
-echo -e "${GREEN}          Deployment Successful! System is Ready.        ${NC}"
-echo -e "${GREEN}=========================================================${NC}"
-
-echo -e "\n${YELLOW}▶ [1/3] Nginx (回退伪装服务)${NC}"
-echo -e "  启停命令 : systemctl {start|stop|restart|status} nginx"
-echo -e "  配置文件 : /etc/nginx/nginx.conf"
-echo -e "  日志文件 : /var/log/nginx/error.log"
-
-echo -e "\n${YELLOW}▶ [2/3] Cloudflare WARP (Socks5落地代理)${NC}"
-echo -e "  主启停令 : systemctl {start|stop|restart|status} warp-svc"
-echo -e "  代理启停 : systemctl {start|stop|restart|status} warp-proxy.service"
-echo -e "  配置文件 : 无配置，使用命令交互 -> warp-cli"
-echo -e "  日志文件 : journalctl -u warp-svc --no-pager -n 50"
-echo -e "  账号信息 : 执行命令查看 -> warp-cli --accept-tos account"
-echo -e "  内部监听 : 127.0.0.1:${WARP_PORT}"
-
-echo -e "\n${YELLOW}▶ [3/3] Xray Core (核心路由与防封锁系统)${NC}"
-echo -e "  启停命令 : systemctl {start|stop|restart|status} xray"
-echo -e "  配置文件 : ${XRAY_CONFIG}"
-echo -e "  日志文件 : /var/log/xray/error.log"
-echo -e "  \n  ${GREEN}--- 客户端连接详细参数 ---${NC}"
-echo -e "  地址 (Address) : ${IPV4}"
-echo -e "  端口 (Port)    : ${XRAY_PORT}"
-echo -e "  协议 (Protocol): vless"
-echo -e "  用户ID (UUID)  : ${UUID}"
-echo -e "  流控 (Flow)    : xtls-rprx-vision"
-echo -e "  传输网 (Network): tcp"
-echo -e "  安全 (Security): reality"
-echo -e "  伪装域 (SNI)   : ${TARGET_SNI}"
-echo -e "  指纹 (uTLS)    : chrome"
-echo -e "  公钥 (PublicKey): ${PUBLIC_KEY}"
-echo -e "  短ID (ShortId) : ${SHORT_ID}"
-
-echo -e "\n${GREEN}--- VLESS 极速分享链接 (直接复制导入客户端) ---${NC}"
-echo -e "vless://${UUID}@${IPV4}:${XRAY_PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${TARGET_SNI}&fp=chrome&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&type=tcp&headerType=none#Xray-Reality-Rocky"
-echo -e "\n${GREEN}=========================================================${NC}"
+IyEvYmluL2Jhc2gKCiMgPT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09
+PT09PT09PT09PT09PT09PT09PT09PT09PT0KIyBYcmF5IFZMRVNTLVJFQUxJVFkgKyBXQVJQIChT
+b2NrczUpIEF1dG8tRGVwbG95bWVudCBTY3JpcHQKIyBUYXJnZXQgT1M6IFJvY2t5IExpbnV4IDgK
+IyBGZWF0dXJlczogSWRlbXBvdGVudCwgQXV0b21hdGVkIFJvdXRpbmcsIFdhdGNoZG9nLCBIZWFs
+dGggQ2hlY2sKIyA9PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09
+PT09PT09PT09PT09PT09PT09PT09PQoKc2V0IC1lCnNldCAtbyBwaXBlZmFpbAoKIyA9PT09PT09
+PT09IFVzZXIgQ29uZmlndXJhdGlvbiAoVmFyaWFibGVzKSA9PT09PT09PT09ClhSQVlfUE9SVD00
+NDMKRkFMTEJBQ0tfUE9SVD04MDgwCldBUlBfUE9SVD00MDAwMAoKVEFSR0VUX1NOST0id3d3Lm52
+aWRpYS5jb20iClhSQVlfQ09ORklHPSIvdXNyL2xvY2FsL2V0Yy94cmF5L2NvbmZpZy5qc29uIgpY
+UkFZX0JJTj0iL3Vzci9sb2NhbC9iaW4veHJheSIKWFJBWV9TRVJWSUNFPSJ4cmF5IgoKV0FSUF9X
+QVRDSERPR19TQ1JJUFQ9Ii91c3IvbG9jYWwvYmluL3dhcnAtd2F0Y2hkb2cuc2giCkNST05fRklM
+RT0iL2V0Yy9jcm9uLmQveHJheS1tYWludGVuYW5jZSIKCiMgQ29sb3Igb3V0cHV0cwpHUkVFTj0n
+XDAzM1sxOzMybScKWUVMTE9XPSdcMDMzWzE7MzNtJwpSRUQ9J1wwMzNbMTszMW0nCk5DPSdcMDMz
+WzBtJwoKbG9nKCkgeyBlY2hvIC1lICIke0dSRUVOfVtJTkZPXSR7TkN9ICQxIjsgfQp3YXJuKCkg
+eyBlY2hvIC1lICIke1lFTExPV31bV0FSTl0ke05DfSAkMSI7IH0KZXJyKCkgeyBlY2hvIC1lICIk
+e1JFRH1bRVJST1JdJHtOQ30gJDEiOyBleGl0IDE7IH0KCmVjaG8gIj09PT09PT09PT09PT09PT09
+PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PSIKZWNobyAiICAgWHJheSBW
+TEVTUy1SRUFMSVRZICsgV0FSUCBJbnN0YWxsYXRpb24gU2NyaXB0ICAgICAgICAgIgplY2hvICIg
+ICAgICAgICAgICAgICAgVGFyZ2V0OiBSb2NreSBMaW51eCA4ICAgICAgICAgICAgICAgICAgICAi
+CmVjaG8gIj09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09
+PT09PT09PSIKCiMgPT09PT09PT09PSAwLiBQcmUtZmxpZ2h0IENoZWNrcyA9PT09PT09PT09Cmxv
+ZyAiQ2hlY2tpbmcgT1MgY29tcGF0aWJpbGl0eS4uLiIKaWYgISBncmVwIC1xaSAiUm9ja3kgTGlu
+dXgiIC9ldGMvcmVkaGF0LXJlbGVhc2UgfHwgISBncmVwIC1xICJyZWxlYXNlIDgiIC9ldGMvcmVk
+aGF0LXJlbGVhc2U7IHRoZW4KICAgIGVyciAiVGhpcyBzY3JpcHQgaXMgc3RyaWN0bHkgZGVzaWdu
+ZWQgZm9yIFJvY2t5IExpbnV4IDguIEFib3J0aW5nLiIKZmkKCmlmIFsgIiRFVUlEIiAtbmUgMCBd
+OyB0aGVuCiAgICBlcnIgIlBsZWFzZSBydW4gdGhpcyBzY3JpcHQgYXMgcm9vdC4iCmZpCgojID09
+PT09PT09PT0gMS4gU3lzdGVtIFVwZGF0ZSAmIERlcGVuZGVuY2llcyA9PT09PT09PT09CmxvZyAi
+SW5zdGFsbGluZyBkZXBlbmRlbmNpZXMuLi4iCmRuZiBpbnN0YWxsIC15IGVwZWwtcmVsZWFzZSA+
+L2Rldi9udWxsIDI+JjEKZG5mIGluc3RhbGwgLXkgY3VybCB3Z2V0IHNvY2F0IGpxIHR6ZGF0YSB1
+dGlsLWxpbnV4IG5naW54ID4vZGV2L251bGwgMj4mMQoKIyA9PT09PT09PT09IDIuIFNldHVwIFRp
+bWV6b25lICYgU0VMaW51eCA9PT09PT09PT09CmxvZyAiQ29uZmlndXJpbmcgVGltZXpvbmUgKEFz
+aWEvU2hhbmdoYWkpLi4uIgp0aW1lZGF0ZWN0bCBzZXQtdGltZXpvbmUgQXNpYS9TaGFuZ2hhaQoK
+bG9nICJEaXNhYmxpbmcgU0VMaW51eC4uLiIKaWYgWyAiJChnZXRlbmZvcmNlKSIgIT0gIkRpc2Fi
+bGVkIiBdOyB0aGVuCiAgICBzZXRlbmZvcmNlIDAgfHwgdHJ1ZQogICAgc2VkIC1pICdzL15TRUxJ
+TlVYPS4qL1NFTElOVVg9ZGlzYWJsZWQvJyAvZXRjL3NlbGludXgvY29uZmlnCmZpCgojID09PT09
+PT09PT0gMy4gTmV0d29yayBPcHRpbWl6YXRpb24gKEJCUikgPT09PT09PT09PQpsb2cgIkFwcGx5
+aW5nIFRDUC9CQlIgT3B0aW1pemF0aW9ucy4uLiIKY2F0IDw8RU9GID4gL2V0Yy9zeXNjdGwuZC85
+OS14cmF5LW9wdGltaXphdGlvbnMuY29uZgpuZXQuY29yZS5kZWZhdWx0X3FkaXNjPWZxCm5ldC5p
+cHY0LnRjcF9jb25nZXN0aW9uX2NvbnRyb2w9YmJyCm5ldC5pcHY0LnRjcF9mYXN0b3Blbj0zCm5l
+dC5pcHY0LnRjcF90d19yZXVzZT0xCm5ldC5jb3JlLnJtZW1fbWF4PTMzNTU0NDMyCm5ldC5jb3Jl
+LndtZW1fbWF4PTMzNTU0NDMyCm5ldC5pcHY0LnRjcF9ybWVtPTQwOTYgODczODAgMzM1NTQ0MzIK
+bmV0LmlwdjQudGNwX3dtZW09NDA5NiA2NTUzNiAzMzU1NDQzMgpuZXQuaXB2NC50Y3BfbXR1X3By
+b2Jpbmc9MQpuZXQuaXB2NC50Y3Bfc2xvd19zdGFydF9hZnRlcl9pZGxlPTAKRU9GCnN5c2N0bCAt
+LXN5c3RlbSA+L2Rldi9udWxsIDI+JjEKCiMgPT09PT09PT09PSA0LiBOZ2lueCBEZWNveSBTZXR1
+cCA9PT09PT09PT09CmxvZyAiQ29uZmlndXJpbmcgTmdpbnggRGVjb3kgb24gcG9ydCAke0ZBTExC
+QUNLX1BPUlR9Li4uIgpjYXQgPDxFT0YgPiAvZXRjL25naW54L25naW54LmNvbmYKdXNlciBuZ2lu
+eDsKd29ya2VyX3Byb2Nlc3NlcyBhdXRvOwplcnJvcl9sb2cgL3Zhci9sb2cvbmdpbngvZXJyb3Iu
+bG9nOwpwaWQgL3J1bi9uZ2lueC5waWQ7CgpldmVudHMgeyB3b3JrZXJfY29ubmVjdGlvbnMgMTAy
+NDsgfQoKaHR0cCB7CiAgICBpbmNsdWRlICAgICAgICAgICAgIC9ldGMvbmdpbngvbWltZS50eXBl
+czsKICAgIGRlZmF1bHRfdHlwZSAgICAgICAgYXBwbGljYXRpb24vb2N0ZXQtc3RyZWFtOwogICAg
+c2VuZGZpbGUgICAgICAgICAgICBvbjsKICAgIGtlZXBhbGl2ZV90aW1lb3V0ICAgNjU7CiAgICBz
+ZXJ2ZXIgewogICAgICAgIGxpc3RlbiAgICAgICAke0ZBTExCQUNLX1BPUlR9OwogICAgICAgIGxp
+c3RlbiAgICAgICBbOjpdOiR7RkFMTEJBQ0tfUE9SVH07CiAgICAgICAgc2VydmVyX25hbWUgIF87
+CiAgICAgICAgcm9vdCAgICAgICAgIC91c3Ivc2hhcmUvbmdpbngvaHRtbDsKICAgICAgICBsb2Nh
+dGlvbiAvIHsgaW5kZXggaW5kZXguaHRtbDsgfQogICAgfQp9CkVPRgpzeXN0ZW1jdGwgZW5hYmxl
+IC0tbm93IG5naW54ID4vZGV2L251bGwgMj4mMQpzeXN0ZW1jdGwgcmVzdGFydCBuZ2lueAoKIyA9
+PT09PT09PT09IDUuIEluc3RhbGwgJiBDb25maWd1cmUgV0FSUCAoU29ja3M1KSA9PT09PT09PT09
+CmxvZyAiU2V0dGluZyB1cCBDbG91ZGZsYXJlIFdBUlAuLi4iCmlmIFsgISAtZiAvZXRjL3l1bS5y
+ZXBvcy5kL2Nsb3VkZmxhcmUtd2FycC5yZXBvIF07IHRoZW4KICBjdXJsIC1mc1NMIGh0dHBzOi8v
+cGtnLmNsb3VkZmxhcmVjbGllbnQuY29tL2Nsb3VkZmxhcmUtd2FycC1hc2NpaS5yZXBvIHwgdGVl
+IC9ldGMveXVtLnJlcG9zLmQvY2xvdWRmbGFyZS13YXJwLnJlcG8gPi9kZXYvbnVsbApmaQpkbmYg
+LXkgaW5zdGFsbCBjbG91ZGZsYXJlLXdhcnAgPi9kZXYvbnVsbCAyPiYxCgpzeXN0ZW1jdGwgZW5h
+YmxlIC0tbm93IHdhcnAtc3ZjID4vZGV2L251bGwgMj4mMQpzbGVlcCAyCgojIFJvYnVzdCBSZWdp
+c3RyYXRpb246IEhhbmRsZSBUT1MgYW5kIGV4aXN0aW5nIGJyb2tlbiByZWdpc3RyYXRpb25zCmlm
+ICEgd2FycC1jbGkgLS1hY2NlcHQtdG9zIGFjY291bnQgMj4vZGV2L251bGwgfCBncmVwIC1xICJB
+Y2NvdW50IFR5cGUiOyB0aGVuCiAgbG9nICJSZWdpc3RlcmluZyBXQVJQIChBdXRvLWFjY2VwdGlu
+ZyBUT1MpLi4uIgogIHdhcnAtY2xpIC0tYWNjZXB0LXRvcyByZWdpc3RyYXRpb24gZGVsZXRlID4v
+ZGV2L251bGwgMj4mMSB8fCB0cnVlCiAgd2FycC1jbGkgLS1hY2NlcHQtdG9zIHJlZ2lzdHJhdGlv
+biBuZXcgPi9kZXYvbnVsbCAyPiYxIHx8IHRydWUKZmkKCmxvZyAiQ29uZmlndXJpbmcgV0FSUCBQ
+cm94eSAmIFdhdGNoZG9nIFNlcnZpY2VzLi4uIgpjYXQgPiAvZXRjL3N5c3RlbWQvc3lzdGVtL3dh
+cnAtcHJveHkuc2VydmljZSA8PEVPRgpbVW5pdF0KRGVzY3JpcHRpb249V0FSUCBQcm94eSBJbml0
+IChTT0NLUzUgJHtXQVJQX1BPUlR9KQpBZnRlcj1uZXR3b3JrLW9ubGluZS50YXJnZXQgd2FycC1z
+dmMuc2VydmljZQpXYW50cz1uZXR3b3JrLW9ubGluZS50YXJnZXQKCltTZXJ2aWNlXQpUeXBlPW9u
+ZXNob3QKRXhlY1N0YXJ0PS9iaW4vYmFzaCAtYyAid2FycC1jbGkgLS1hY2NlcHQtdG9zIG1vZGUg
+cHJveHkgPi9kZXYvbnVsbCAyPiYxIHx8IHRydWU7IHdhcnAtY2xpIC0tYWNjZXB0LXRvcyBwcm94
+eSBwb3J0ICR7V0FSUF9QT1JUfSA+L2Rldi9udWxsIDI+JjEgfHwgdHJ1ZTsgd2FycC1jbGkgLS1h
+Y2NlcHQtdG9zIGNvbm5lY3QgPi9kZXYvbnVsbCAyPiYxIHx8IHRydWUiClJlbWFpbkFmdGVyRXhp
+dD15ZXMKCltJbnN0YWxsXQpXYW50ZWRCeT1tdWx0aS11c2VyLnRhcmdldApFT0YKCmNhdCA+ICIk
+V0FSUF9XQVRDSERPR19TQ1JJUFQiIDw8RU9GCiMhL2Jpbi9iYXNoCnNldCAtZXVvIHBpcGVmYWls
+CldBUlBfUE9SVD0ke1dBUlBfUE9SVH0Kc3lzdGVtY3RsIGlzLWFjdGl2ZSAtLXF1aWV0IHdhcnAt
+c3ZjIHx8IHN5c3RlbWN0bCByZXN0YXJ0IHdhcnAtc3ZjCmlmIHdhcnAtY2xpIC0tYWNjZXB0LXRv
+cyBzdGF0dXMgMj4vZGV2L251bGwgfCBncmVwIC1xICJDb25uZWN0ZWQiOyB0aGVuCiAgc3MgLWxu
+dCAyPi9kZXYvbnVsbCB8IGdyZXAgLXEgIjpcJFdBUlBfUE9SVCAiICYmIGV4aXQgMApmaQp3YXJw
+LWNsaSAtLWFjY2VwdC10b3MgbW9kZSBwcm94eSA+L2Rldi9udWxsIDI+JjEgfHwgdHJ1ZQp3YXJw
+LWNsaSAtLWFjY2VwdC10b3MgcHJveHkgcG9ydCBcJFdBUlBfUE9SVCA+L2Rldi9udWxsIDI+JjEg
+fHwgdHJ1ZQp3YXJwLWNsaSAtLWFjY2VwdC10b3MgY29ubmVjdCA+L2Rldi9udWxsIDI+JjEgfHwg
+dHJ1ZQpFT0YKY2htb2QgK3ggIiRXQVJQX1dBVENIRE9HX1NDUklQVCIKCmNhdCA+IC9ldGMvc3lz
+dGVtZC9zeXN0ZW0vd2FycC13YXRjaGRvZy5zZXJ2aWNlIDw8RU9GCltVbml0XQpEZXNjcmlwdGlv
+bj1XQVJQIFdhdGNoZG9nCgpbU2VydmljZV0KVHlwZT1vbmVzaG90CkV4ZWNTdGFydD0ke1dBUlBf
+V0FUQ0hET0dfU0NSSVBUfQpFT0YKCmNhdCA+IC9ldGMvc3lzdGVtZC9zeXN0ZW0vd2FycC13YXRj
+aGRvZy50aW1lciA8PEVPRgpbVW5pdF0KRGVzY3JpcHRpb249UnVuIFdBUlAgV2F0Y2hkb2cgZXZl
+cnkgMiBtaW51dGVzCgpbVGltZXJdCk9uQm9vdFNlYz0zMApPblVuaXRBY3RpdmVTZWM9MTIwClVu
+aXQ9d2FycC13YXRjaGRvZy5zZXJ2aWNlCgpbSW5zdGFsbF0KV2FudGVkQnk9dGltZXJzLnRhcmdl
+dApFT0YKCnN5c3RlbWN0bCBkYWVtb24tcmVsb2FkCnN5c3RlbWN0bCBlbmFibGUgLS1ub3cgd2Fy
+cC1wcm94eS5zZXJ2aWNlID4vZGV2L251bGwgMj4mMQpzeXN0ZW1jdGwgZW5hYmxlIC0tbm93IHdh
+cnAtd2F0Y2hkb2cudGltZXIgPi9kZXYvbnVsbCAyPiYxCgojID09PT09PT09PT0gNi4gSW5zdGFs
+bCBYcmF5IENvcmUgPT09PT09PT09PQpsb2cgIkluc3RhbGxpbmcgWHJheSBDb3JlLi4uIgpiYXNo
+IC1jICIkKGN1cmwgLUwgaHR0cHM6Ly9naXRodWIuY29tL1hUTFMvWHJheS1pbnN0YWxsL3Jhdy9t
+YWluL2luc3RhbGwtcmVsZWFzZS5zaCkiIEAgaW5zdGFsbCAtdSByb290ID4vZGV2L251bGwgMj4m
+MQoKIyA9PT09PT09PT09IDcuIEhhbmRsZSBDcmVkZW50aWFscyAoSWRlbXBvdGVuY3kpID09PT09
+PT09PT0KbG9nICJDaGVja2luZyBmb3IgZXhpc3RpbmcgWHJheSBjcmVkZW50aWFscy4uLiIKVVVJ
+RD0iIgpQUklWQVRFX0tFWT0iIgpTSE9SVF9JRD0iIgoKaWYgWyAtZiAiJFhSQVlfQ09ORklHIiBd
+ICYmIGNvbW1hbmQgLXYganEgPi9kZXYvbnVsbDsgdGhlbgogICAgVVVJRD0kKGpxIC1yICcuaW5i
+b3VuZHNbMF0uc2V0dGluZ3MuY2xpZW50c1swXS5pZCcgIiRYUkFZX0NPTkZJRyIgMj4vZGV2L251
+bGwgfHwgdHJ1ZSkKICAgIFBSSVZBVEVfS0VZPSQoanEgLXIgJy5pbmJvdW5kc1swXS5zdHJlYW1T
+ZXR0aW5ncy5yZWFsaXR5U2V0dGluZ3MucHJpdmF0ZUtleScgIiRYUkFZX0NPTkZJRyIgMj4vZGV2
+L251bGwgfHwgdHJ1ZSkKICAgIFNIT1JUX0lEPSQoanEgLXIgJy5pbmJvdW5kc1swXS5zdHJlYW1T
+ZXR0aW5ncy5yZWFsaXR5U2V0dGluZ3Muc2hvcnRJZHNbMF0nICIkWFJBWV9DT05GSUciIDI+L2Rl
+di9udWxsIHx8IHRydWUpCmZpCgojIENsZWFuIHVwIGVtcHR5IHN0cmluZ3MgZnJvbSBicm9rZW4g
+anEgcmVhZHMgKEZpeGluZyB0aGUgcHJldmlvdXMgc3ludGF4IGJ1ZykKaWYgWyAiJFVVSUQiID09
+ICJudWxsIiBdOyB0aGVuIAogICAgVVVJRD0iIgpmaQoKaWYgWyAiJFBSSVZBVEVfS0VZIiA9PSAi
+bnVsbCIgXTsgdGhlbiAKICAgIFBSSVZBVEVfS0VZPSIiCmZpCgppZiBbICIkU0hPUlRfSUQiID09
+ICJudWxsIiBdOyB0aGVuIAogICAgU0hPUlRfSUQ9IiIKZmkKCiMgR2VuZXJhdGUgY3JlZGVudGlh
+bHMgaWYgdGhleSBhcmUgZW1wdHkKaWYgWyAteiAiJFVVSUQiIF07IHRoZW4KICAgIFVVSUQ9JCh1
+dWlkZ2VuKQogICAgbG9nICJHZW5lcmF0ZWQgbmV3IFVVSUQuIgpmaQoKaWYgWyAteiAiJFBSSVZB
+VEVfS0VZIiBdOyB0aGVuCiAgICBLRVlfUEFJUj0kKCRYUkFZX0JJTiB4MjU1MTkpCiAgICBQUklW
+QVRFX0tFWT0kKGVjaG8gIiRLRVlfUEFJUiIgfCBncmVwIC1pICJQcml2YXRlIiB8IGN1dCAtZCc6
+JyAtZjIgfCB0ciAtZCAnICcgfCB0ciAtZCAnXHInKQogICAgUFVCTElDX0tFWT0kKGVjaG8gIiRL
+RVlfUEFJUiIgfCBncmVwIC1pICJQdWJsaWMiIHwgY3V0IC1kJzonIC1mMiB8IHRyIC1kICcgJyB8
+IHRyIC1kICdccicpCiAgICBsb2cgIkdlbmVyYXRlZCBuZXcgUkVBTElUWSBLZXkgUGFpci4iCmVs
+c2UKICAgIFBVQkxJQ19LRVk9JCgkWFJBWV9CSU4geDI1NTE5IC1pICIkUFJJVkFURV9LRVkiIHwg
+Z3JlcCAtaSAiUHVibGljIiB8IGN1dCAtZCc6JyAtZjIgfCB0ciAtZCAnICcgfCB0ciAtZCAnXHIn
+KQogICAgbG9nICJSZXN0b3JlZCBleGlzdGluZyBSRUFMSVRZIEtleXMuIgpmaQoKaWYgWyAteiAi
+JFNIT1JUX0lEIiBdOyB0aGVuCiAgICBTSE9SVF9JRD0kKG9wZW5zc2wgcmFuZCAtaGV4IDQpCiAg
+ICBsb2cgIkdlbmVyYXRlZCBuZXcgU2hvcnRJRC4iCmZpCgojID09PT09PT09PT0gOC4gV3JpdGUg
+WHJheSBDb25maWd1cmF0aW9uID09PT09PT09PT0KbG9nICJHZW5lcmF0aW5nIFhyYXkgQ29uZmln
+dXJhdGlvbi4uLiIKbWtkaXIgLXAgIiQoZGlybmFtZSAiJFhSQVlfQ09ORklHIikiCm1rZGlyIC1w
+IC92YXIvbG9nL3hyYXkKY2hvd24gLVIgcm9vdDpyb290IC92YXIvbG9nL3hyYXkKCmNhdCA8PEVP
+RiA+ICIkWFJBWV9DT05GSUciCnsKICAibG9nIjogeyAibG9nbGV2ZWwiOiAiZXJyb3IiLCAiYWNj
+ZXNzIjogIi9kZXYvbnVsbCIsICJlcnJvciI6ICIvdmFyL2xvZy94cmF5L2Vycm9yLmxvZyIgfSwK
+ICAiZG5zIjogewogICAgInRhZyI6ICJkbnMtaW50ZXJuYWwiLAogICAgInF1ZXJ5U3RyYXRlZ3ki
+OiAiVXNlSVAiLAogICAgImRpc2FibGVDYWNoZSI6IGZhbHNlLAogICAgInNlcnZlcnMiOlsKICAg
+ICAgeyAiYWRkcmVzcyI6ICJodHRwczovLzEuMS4xLjEvZG5zLXF1ZXJ5IiwgImRvbWFpbnMiOiBb
+Imdlb3NpdGU6Z2VvbG9jYXRpb24tIWNuIl0sICJza2lwRmFsbGJhY2siOiB0cnVlIH0sCiAgICAg
+IHsgImFkZHJlc3MiOiAiaHR0cHM6Ly8yMjMuNS41LjUvZG5zLXF1ZXJ5IiwgImRvbWFpbnMiOlsi
+Z2Vvc2l0ZTpjbiJdLCAiZXhwZWN0SVBzIjogWyJnZW9pcDpjbiJdLCAic2tpcEZhbGxiYWNrIjog
+ZmFsc2UgfQogICAgXQogIH0sCiAgInJvdXRpbmciOiB7CiAgICAiZG9tYWluU3RyYXRlZ3kiOiAi
+SVBPbkRlbWFuZCIsCiAgICAicnVsZXMiOlsKICAgICAgeyAidHlwZSI6ICJmaWVsZCIsICJvdXRi
+b3VuZFRhZyI6ICJibG9jayIsICJwcm90b2NvbCI6IFsiYml0dG9ycmVudCJdIH0sCiAgICAgIHsg
+InR5cGUiOiAiZmllbGQiLCAib3V0Ym91bmRUYWciOiAiYmxvY2siLCAiZG9tYWluIjpbImdlb3Np
+dGU6Y2F0ZWdvcnktYWRzLWFsbCJdIH0sCiAgICAgIHsgInR5cGUiOiAiZmllbGQiLCAib3V0Ym91
+bmRUYWciOiAiYmxvY2siLCAiaXAiOiBbImdlb2lwOnByaXZhdGUiXSB9LAogICAgICB7ICJ0eXBl
+IjogImZpZWxkIiwgIm91dGJvdW5kVGFnIjogImJsb2NrIiwgImRvbWFpbiI6IFsiZ2Vvc2l0ZTpj
+biJdIH0sCiAgICAgIHsgInR5cGUiOiAiZmllbGQiLCAib3V0Ym91bmRUYWciOiAiYmxvY2siLCAi
+aXAiOiBbImdlb2lwOmNuIl0gfSwKICAgICAgeyAidHlwZSI6ICJmaWVsZCIsICJvdXRib3VuZFRh
+ZyI6ICJkaXJlY3QiLCAiZG9tYWluIjpbCiAgICAgICAgImRvbWFpbjp3aGF0aXNteWlwYWRkcmVz
+cy5jb20iLCAiZG9tYWluOmdvb2dsZS5jb20iLCAiZG9tYWluOmdvb2dsZWFwaXMuY29tIiwgCiAg
+ICAgICAgImRvbWFpbjpnc3RhdGljLmNvbSIsICJkb21haW46Z21haWwuY29tIiwgImRvbWFpbjpj
+aGF0Z3B0LmNvbSIsICJkb21haW46b3BlbmFpLmNvbSIsIAogICAgICAgICJkb21haW46b2Fpc3Rh
+dGljLmNvbSIsICJkb21haW46b2FpdXNlcmNvbnRlbnQuY29tIiwgImRvbWFpbjphbnRocm9waWMu
+Y29tIiwgCiAgICAgICAgImRvbWFpbjpjbGF1ZGUuYWkiLCAiZG9tYWluOmxpbnV4LmRvIiwgImRv
+bWFpbjppZGNmbGFyZS5jb20iLCAiZG9tYWluOmRtaXQuaW8iLCAiZG9tYWluOnZtcmFjay5uZXQi
+CiAgICAgIF19LAogICAgICB7ICJ0eXBlIjogImZpZWxkIiwgIm91dGJvdW5kVGFnIjogIndhcnAi
+LCAiZG9tYWluIjpbImdlb3NpdGU6Z2VvbG9jYXRpb24tIWNuIl19LAogICAgICB7ICJ0eXBlIjog
+ImZpZWxkIiwgIm91dGJvdW5kVGFnIjogIndhcnAiLCAiaXAiOlsiZ2VvaXA6IWNuIl19LAogICAg
+ICB7ICJ0eXBlIjogImZpZWxkIiwgIm5ldHdvcmsiOiAidGNwLHVkcCIsICJvdXRib3VuZFRhZyI6
+ICJ3YXJwIiB9CiAgICBdCiAgfSwKICAiaW5ib3VuZHMiOlsKICAgIHsKICAgICAgImxpc3RlbiI6
+ICI6OiIsCiAgICAgICJwb3J0IjogJHtYUkFZX1BPUlR9LAogICAgICAicHJvdG9jb2wiOiAidmxl
+c3MiLAogICAgICAic2V0dGluZ3MiOiB7CiAgICAgICAgImNsaWVudHMiOlt7ICJpZCI6ICIke1VV
+SUR9IiwgImZsb3ciOiAieHRscy1ycHJ4LXZpc2lvbiIgfV0sCiAgICAgICAgImRlY3J5cHRpb24i
+OiAibm9uZSIsCiAgICAgICAgImZhbGxiYWNrcyI6W3sgImRlc3QiOiAke0ZBTExCQUNLX1BPUlR9
+LCAieHZlciI6IDAgfV0KICAgICAgfSwKICAgICAgInN0cmVhbVNldHRpbmdzIjogewogICAgICAg
+ICJuZXR3b3JrIjogInRjcCIsCiAgICAgICAgInNlY3VyaXR5IjogInJlYWxpdHkiLAogICAgICAg
+ICJyZWFsaXR5U2V0dGluZ3MiOiB7CiAgICAgICAgICAic2hvdyI6IGZhbHNlLAogICAgICAgICAg
+ImRlc3QiOiAiJHtUQVJHRVRfU05JfTo0NDMiLAogICAgICAgICAgInh2ZXIiOiAwLAogICAgICAg
+ICAgInNlcnZlck5hbWVzIjpbIiR7VEFSR0VUX1NOSX0iXSwKICAgICAgICAgICJwcml2YXRlS2V5
+IjogIiR7UFJJVkFURV9LRVl9IiwKICAgICAgICAgICJzaG9ydElkcyI6WyIke1NIT1JUX0lEfSJd
+CiAgICAgICAgfSwKICAgICAgICAic29ja29wdCI6IHsgInRjcEZhc3RPcGVuIjogZmFsc2UsICJm
+cmVlYmluZCI6IHRydWUgfQogICAgICB9LAogICAgICAic25pZmZpbmciOiB7ICJlbmFibGVkIjog
+dHJ1ZSwgImRlc3RPdmVycmlkZSI6WyJodHRwIiwgInRscyIsICJxdWljIl0sICJtZXRhZGF0YU9u
+bHkiOiBmYWxzZSwgInJvdXRlT25seSI6IHRydWUgfQogICAgfQogIF0sCiAgIm91dGJvdW5kcyI6
+WwogICAgeyAidGFnIjogIndhcnAiLCJwcm90b2NvbCI6InNvY2tzIiwic2V0dGluZ3MiOnsic2Vy
+dmVycyI6W3siYWRkcmVzcyI6IjEyNy4wLjAuMSIsInBvcnQiOiR7V0FSUF9QT1JUfX1dfX0sCiAg
+ICB7ICJ0YWciOiAiZGlyZWN0IiwgInByb3RvY29sIjogImZyZWVkb20iLCAic2V0dGluZ3MiOiB7
+ICJkb21haW5TdHJhdGVneSI6ICJVc2VJUHY0IiB9IH0sCiAgICB7ICJ0YWciOiAiYmxvY2siLCAi
+cHJvdG9jb2wiOiAiYmxhY2tob2xlIiB9CiAgXQp9CkVPRgoKIyA9PT09PT09PT09IDkuIEZpbmFs
+aXplIFhyYXkgU2VydmljZXMgPT09PT09PT09PQpsb2cgIlZhbGlkYXRpbmcgWHJheSBjb25maWcu
+Li4iCmlmICEgJFhSQVlfQklOIC10ZXN0IC1jb25maWcgIiRYUkFZX0NPTkZJRyI7IHRoZW4KICAg
+IGVjaG8gLWUgIlxuJHtSRUR9W0VSUk9SXSBYcmF5IGNvbmZpZ3VyYXRpb24gdmFsaWRhdGlvbiBm
+YWlsZWQhJHtOQ30iCiAgICBleGl0IDEKZmkKbG9nICJDb25maWd1cmF0aW9uIE9LLiIKCnN5c3Rl
+bWN0bCBlbmFibGUgLS1ub3cgJFhSQVlfU0VSVklDRSA+L2Rldi9udWxsIDI+JjEKc3lzdGVtY3Rs
+IHJlc3RhcnQgJFhSQVlfU0VSVklDRQoKIyA9PT09PT09PT09IDEwLiBGaXJld2FsbCBDb25maWd1
+cmF0aW9uID09PT09PT09PT0KbG9nICJDb25maWd1cmluZyBGaXJld2FsbGQuLi4iCmlmIHN5c3Rl
+bWN0bCBpcy1hY3RpdmUgLS1xdWlldCBmaXJld2FsbGQ7IHRoZW4KICAgIGZpcmV3YWxsLWNtZCAt
+LXBlcm1hbmVudCAtLWFkZC1wb3J0PSR7WFJBWV9QT1JUfS90Y3AgPi9kZXYvbnVsbCAyPiYxIHx8
+IHRydWUKICAgIGZpcmV3YWxsLWNtZCAtLXJlbG9hZCA+L2Rldi9udWxsIDI+JjEKZWxzZQogICAg
+d2FybiAiRmlyZXdhbGxkIGlzIG5vdCBydW5uaW5nLiBTa2lwcGluZyBwb3J0IHJ1bGVzLiIKZmkK
+CiMgPT09PT09PT09PSAxMS4gTWFpbnRlbmFuY2UgQ3JvbiBKb2JzIChJZGVtcG90ZW50KSA9PT09
+PT09PT09CmxvZyAiQWRkaW5nIE1haW50ZW5hbmNlIENyb24gSm9icyB0byAvZXRjL2Nyb24uZC8g
+Li4uIgpjYXQgPDxFT0YgPiAiJENST05fRklMRSIKIyBYcmF5ICYgU3lzdGVtIE1haW50ZW5hbmNl
+IFRhc2tzCjAgKiAqICogKiByb290IHN5bmM7IGVjaG8gMyA+IC9wcm9jL3N5cy92bS9kcm9wX2Nh
+Y2hlcwowIDIgKiAqIDAgcm9vdCBiYXNoIC1jICJcJChjdXJsIC1zTCBodHRwczovL2dpdGh1Yi5j
+b20vWFRMUy9YcmF5LWluc3RhbGwvcmF3L21haW4vaW5zdGFsbC1yZWxlYXNlLnNoKSIgQCBpbnN0
+YWxsIC11IHJvb3QgPi9kZXYvbnVsbCAyPiYxCjAgMyAqICogMCByb290IGRuZiAteSB1cGdyYWRl
+ID4+IC92YXIvbG9nL2RuZi11cGdyYWRlLmxvZyAyPiYxICYmIC9zYmluL3JlYm9vdApFT0YKY2ht
+b2QgNjQ0ICIkQ1JPTl9GSUxFIgoKIyA9PT09PT09PT09IDEyLiBGaW5hbCBIZWFsdGggQ2hlY2sg
+PT09PT09PT09PQplY2hvIC1lICJcbiR7WUVMTE9XfT4+PiBQZXJmb3JtaW5nIGZpbmFsIGhlYWx0
+aCBjaGVja3Mgb24gYWxsIGNvbXBvbmVudHMuLi4ke05DfSIKSEVBTFRIX0ZMQUc9MAoKaWYgc3lz
+dGVtY3RsIGlzLWFjdGl2ZSAtLXF1aWV0IG5naW54OyB0aGVuCiAgICBlY2hvIC1lICIgIFvinJRd
+IE5naW54IChEZWNveSkgICA6ICR7R1JFRU59UnVubmluZyR7TkN9IgplbHNlCiAgICBlY2hvIC1l
+ICIgIFvinJhdIE5naW54IChEZWNveSkgICA6ICR7UkVEfUZhaWxlZCR7TkN9IChDaGVjazogam91
+cm5hbGN0bCAtdSBuZ2lueCAtLW5vLXBhZ2VyIC1uIDIwKSIKICAgIEhFQUxUSF9GTEFHPTEKZmkK
+CmlmIHN5c3RlbWN0bCBpcy1hY3RpdmUgLS1xdWlldCB3YXJwLXN2YyAmJiBzcyAtbG50IHwgZ3Jl
+cCAtcSAiOiR7V0FSUF9QT1JUfSAiOyB0aGVuCiAgICBlY2hvIC1lICIgIFvinJRdIFdBUlAgKFNv
+Y2tzNSkgICA6ICR7R1JFRU59UnVubmluZyAmIFByb3h5aW5nIG9uIHBvcnQgJHtXQVJQX1BPUlR9
+JHtOQ30iCmVsc2UKICAgIGVjaG8gLWUgIiAgW+KcmF0gV0FSUCAoU29ja3M1KSAgIDogJHtSRUR9
+RmFpbGVkJHtOQ30gKENoZWNrOiB3YXJwLWNsaSBzdGF0dXMgT1Igc3lzdGVtY3RsIHN0YXR1cyB3
+YXJwLXByb3h5KSIKICAgIEhFQUxUSF9GTEFHPTEKZmkKCmlmIHN5c3RlbWN0bCBpcy1hY3RpdmUg
+LS1xdWlldCAkWFJBWV9TRVJWSUNFOyB0aGVuCiAgICBlY2hvIC1lICIgIFvinJRdIFhyYXkgQ29y
+ZSAgICAgICA6ICR7R1JFRU59UnVubmluZyR7TkN9IgplbHNlCiAgICBlY2hvIC1lICIgIFvinJhd
+IFhyYXkgQ29yZSAgICAgICA6ICR7UkVEfUZhaWxlZCR7TkN9IChDaGVjazogam91cm5hbGN0bCAt
+dSAkWFJBWV9TRVJWSUNFIC0tbm8tcGFnZXIgLW4gMjApIgogICAgSEVBTFRIX0ZMQUc9MQpmaQoK
+aWYgWyAiJEhFQUxUSF9GTEFHIiAtbmUgMCBdOyB0aGVuCiAgICBlY2hvIC1lICJcbiR7UkVEfT09
+PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PSR7
+TkN9IgogICAgZWNobyAtZSAiJHtSRUR9ICAgRGVwbG95bWVudCBGaW5pc2hlZCB3aXRoIEVycm9y
+cyEgICAgICAgICAgICAgICAgICAgICAgJHtOQ30iCiAgICBlY2hvIC1lICIke1JFRH0gICBQbGVh
+c2UgZml4IHRoZSBmYWlsZWQgc2VydmljZXMgYmVmb3JlIHVzaW5nLiAgICAgICAgICAke05DfSIK
+ICAgIGVjaG8gLWUgIiR7UkVEfT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09
+PT09PT09PT09PT09PT09PT09PSR7TkN9XG4iCiAgICBleGl0IDEKZmkKCiMgPT09PT09PT09PSAx
+My4gT3V0cHV0IEluZm9ybWF0aW9uID09PT09PT09PT0KSVBWND0kKGN1cmwgLXM0IGh0dHBzOi8v
+YXBpLmlwaWZ5Lm9yZyB8fCBlY2hvICJZT1VSX0lQVjQiKQoKZWNobyAtZSAiXG4ke0dSRUVOfT09
+PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PSR7
+TkN9IgplY2hvIC1lICIke0dSRUVOfSAgICAgICAgICBEZXBsb3ltZW50IFN1Y2Nlc3NmdWwhIFN5
+c3RlbSBpcyBSZWFkeS4gICAgICAgICR7TkN9IgplY2hvIC1lICIke0dSRUVOfT09PT09PT09PT09
+PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PSR7TkN9IgoKZWNo
+byAtZSAiXG4ke1lFTExPV33ilrYgWzEvM10gTmdpbnggKOWbnumAgOS8quijheacjeWKoSkke05D
+fSIKZWNobyAtZSAiICDlkK/lgZzlkb3ku6QgOiBzeXN0ZW1jdGwge3N0YXJ0fHN0b3B8cmVzdGFy
+dHxzdGF0dXN9IG5naW54IgplY2hvIC1lICIgIOmFjee9ruaWh+S7tiA6IC9ldGMvbmdpbngvbmdp
+bnguY29uZiIKZWNobyAtZSAiICDml6Xlv5fmlofku7YgOiAvdmFyL2xvZy9uZ2lueC9lcnJvci5s
+b2ciCgplY2hvIC1lICJcbiR7WUVMTE9XfeKWtiBbMi8zXSBDbG91ZGZsYXJlIFdBUlAgKFNvY2tz
+NeiQveWcsOS7o+eQhikke05DfSIKZWNobyAtZSAiICDkuLvlkK/lgZzku6QgOiBzeXN0ZW1jdGwg
+e3N0YXJ0fHN0b3B8cmVzdGFydHxzdGF0dXN9IHdhcnAtc3ZjIgplY2hvIC1lICIgIOS7o+eQhuWQ
+r+WBnCA6IHN5c3RlbWN0bCB7c3RhcnR8c3RvcHxyZXN0YXJ0fHN0YXR1c30gd2FycC1wcm94eS5z
+ZXJ2aWNlIgplY2hvIC1lICIgIOmFjee9ruaWh+S7tiA6IOaXoOmFjee9ru+8jOS9v+eUqOWRveS7
+pOS6pOS6kiAtPiB3YXJwLWNsaSIKZWNobyAtZSAiICDml6Xlv5fmlofku7YgOiBqb3VybmFsY3Rs
+IC11IHdhcnAtc3ZjIC0tbm8tcGFnZXIgLW4gNTAiCmVjaG8gLWUgIiAg6LSm5Y+35L+h5oGvIDog
+5omn6KGM5ZG95Luk5p+l55yLIC0+IHdhcnAtY2xpIC0tYWNjZXB0LXRvcyBhY2NvdW50IgplY2hv
+IC1lICIgIOWGhemDqOebkeWQrCA6IDEyNy4wLjAuMToke1dBUlBfUE9SVH0iCgplY2hvIC1lICJc
+biR7WUVMTE9XfeKWtiBbMy8zXSBYcmF5IENvcmUgKOaguOW/g+i3r+eUseS4jumYsuWwgemUgeez
+u+e7nykke05DfSIKZWNobyAtZSAiICDlkK/lgZzlkb3ku6QgOiBzeXN0ZW1jdGwge3N0YXJ0fHN0
+b3B8cmVzdGFydHxzdGF0dXN9IHhyYXkiCmVjaG8gLWUgIiAg6YWN572u5paH5Lu2IDogJHtYUkFZ
+X0NPTkZJR30iCmVjaG8gLWUgIiAg5pel5b+X5paH5Lu2IDogL3Zhci9sb2cveHJheS9lcnJvci5s
+b2ciCmVjaG8gLWUgIiAgXG4gICR7R1JFRU59LS0tIOWuouaIt+err+i/nuaOpeivpue7huWPguaV
+sCAtLS0ke05DfSIKZWNobyAtZSAiICDlnLDlnYAgKEFkZHJlc3MpIDogJHtJUFY0fSIKZWNobyAt
+ZSAiICDnq6/lj6MgKFBvcnQpICAgIDogJHtYUkFZX1BPUlR9IgplY2hvIC1lICIgIOWNj+iuriAo
+UHJvdG9jb2wpOiB2bGVzcyIKZWNobyAtZSAiICDnlKjmiLdJRCAoVVVJRCkgIDogJHtVVUlEfSIK
+ZWNobyAtZSAiICDmtYHmjqcgKEZsb3cpICAgIDogeHRscy1ycHJ4LXZpc2lvbiIKZWNobyAtZSAi
+ICDkvKDovpPnvZEgKE5ldHdvcmspOiB0Y3AiCmVjaG8gLWUgIiAg5a6J5YWoIChTZWN1cml0eSk6
+IHJlYWxpdHkiCmVjaG8gLWUgIiAg5Lyq6KOF5Z+fIChTTkkpICAgOiAke1RBUkdFVF9TTkl9Igpl
+Y2hvIC1lICIgIOaMh+e6uSAodVRMUykgICAgOiBjaHJvbWUiCmVjaG8gLWUgIiAg5YWs6ZKlIChQ
+dWJsaWNLZXkpOiAke1BVQkxJQ19LRVl9IgplY2hvIC1lICIgIOefrUlEIChTaG9ydElkKSA6ICR7
+U0hPUlRfSUR9IgoKZWNobyAtZSAiXG4ke0dSRUVOfS0tLSBWTEVTUyDmnoHpgJ/liIbkuqvpk77m
+jqUgKOebtOaOpeWkjeWItuWvvOWFpeWuouaIt+errykgLS0tJHtOQ30iCmVjaG8gLWUgInZsZXNz
+Oi8vJHtVVUlEfUAke0lQVjR9OiR7WFJBWV9QT1JUfT9lbmNyeXB0aW9uPW5vbmUmZmxvdz14dGxz
+LXJwcngtdmlzaW9uJnNlY3VyaXR5PXJlYWxpdHkmc25pPSR7VEFSR0VUX1NOSX0mZnA9Y2hyb21l
+JnBiaz0ke1BVQkxJQ19LRVl9JnNpZD0ke1NIT1JUX0lEfSZ0eXBlPXRjcCZoZWFkZXJUeXBlPW5v
+bmUjWHJheS1SZWFsaXR5LVJvY2t5IgplY2hvIC1lICJcbiR7R1JFRU59PT09PT09PT09PT09PT09
+PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09JHtOQ30iCg==
